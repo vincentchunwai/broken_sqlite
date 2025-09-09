@@ -2,7 +2,7 @@ use std::io::{Write, Seek, SeekFrom};
 
 pub const PAGE_SIZE: usize = 4096;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord)]
 pub struct PageId(pub u64);
 
 pub struct Page {
