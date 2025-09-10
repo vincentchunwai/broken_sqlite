@@ -1,8 +1,11 @@
 use std::io::{Write, Seek, SeekFrom};
+use std::cmp::Ordering;
+use std::fs::*;
+use std::io::Read;
 
 pub const PAGE_SIZE: usize = 4096;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct PageId(pub u64);
 
 pub struct Page {

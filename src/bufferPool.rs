@@ -1,8 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 
-mod page;
-use pager::{Pager, Page, PageId, PAGE_SIZE};
+use crate::page;
+use page::{Pager, Page, PageId, PAGE_SIZE};
 
 pub struct BufferPool {
     page: Pager,
@@ -12,12 +12,12 @@ pub struct BufferPool {
 }
 
 impl BufferPool {
-    pub fn new(pager: Pager, capacity: usize) -> Self {
+    pub fn new(page: Pager, capacity: usize) -> Self {
         Self {
-            pager,
+            page,
             cache: HashMap::new(),
             lru: VecDeque::new(),
-            capacity
+            max_pages: capacity
         }
     }
 
@@ -26,10 +26,10 @@ impl BufferPool {
         if self.cache.contains_key(&id) {
             self.promote(id);
         } else {
-            if self.cache.len() >= self.capacity {
+            if self.cache.len() >= self.max_pages {
                 self.evict_one()?;
             }
-            let page = self.pager.read_page(id)?;
+            let page = self.page.read_page(id)?;
             self.cache.insert(id, page);
             self.lru.push_back(id);
         }
@@ -48,7 +48,7 @@ impl BufferPool {
     pub fn flush(&mut self) -> io::Result<()> {
         for page in self.cache.values_mut() {
             if page.dirty {
-                self.pager.write_page(page)?;
+                self.page.write_page(page)?;
                 page.dirty = false;
             }
         }
@@ -61,7 +61,7 @@ impl BufferPool {
         if let Some(victim_id) = self.lru.pop_front() {
             if let Some(page) = self.cache.remove(&victim_id) {
                 if page.dirty {
-                    self.pager.write_page(&page)?;
+                    self.page.write_page(&page)?;
                 }
             }
         }
