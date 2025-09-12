@@ -1,136 +1,142 @@
 mod page;
 
+use crate::bufferPool::BufferPool;
 use page::PageId;
-
-// Each node except root must have at least t-1 keys and at most 2t-1 keys
-const T: usize = 16; // Max 31 keys, 32 children to avoid stack overflow
+use std::io;
 
 #[derive(Debug)]
 pub struct BTree {
-    root: Node
+    root_page_id: Option<PageId>,
 }
 
 #[derive(Debug, Default)]
 pub struct Node {
     keys: Vec<PageId>,
-    children: Vec<Node>,
+    children: Vec<PageId>,
     is_leaf: bool
 }
 
 impl BTree {
     fn new() -> Self {
         BTree {
-            root: Node {
-                keys: Vec::new(),
-                children: Vec::new(),
-                is_leaf: true,
-            },
+            root_page_id: None,
         }
     }
 
-    fn insert(&mut self, key: PageId) {
-        if self.root.keys.len() == 2 * T - 1 {
-            let mut new_root = Node {
-                keys: Vec::new(),
-                children: Vec::new(),
-                is_leaf: false,
-            };
-            new_root.children.push(std::mem::replace(&mut self.root, Node::empty_leaf()));
-            new_root.split_child(0);
-            new_root.insert_non_full(key);
-            self.root = new_root;
-        } else {
-            self.root.insert_non_full(key);
+    fn insert(&mut self, key: PageId, buffer_pool: &mut BufferPool) -> io::Result<()> {
+        match self.root_page_id {
+            None => {
+                // Create first root
+                let root_node = Node {
+                    keys: vec![key],
+                    children: Vec::new(),
+                    is_leaf: true,
+                };
+                let root_page_id = self.allocate_node(root_node, buffer_pool)?;
+                self.root_page_id = Some(root_page_id);
+            }
+            Some(root_id) => {
+                let root_node = self.load_node(root_id, buffer_pool)?;
+                if root_node.keys.len() == 2 * T - 1 {
+                    // Split root
+                    let new_root = Node {
+                        keys: Vec::new(),
+                        children: vec![root_id],
+                        is_leaf: false,
+                    };
+                    let new_root_id = self.allocate_node(new_root, buffer_pool)?;
+                    self.split_child(new_root_id, 0, buffer_pool)?;
+                    self.insert_non_full(new_root_id, key, buffer_pool)?;
+                    self.root_page_id = Some(new_root_id);
+                } else {
+                    self.insert_non_full(root_id, key, buffer_pool)?;
+                }
+            }
         }
     }
 
-    fn contains(&self, key: PageId) -> bool {
-        self.root.search(key).is_some()
-    }
-
-    fn print_inorder(&self) {
-        self.root.print_inorder();
-        println!();
+    fn search(&self, key: PageId, buffer_pool: &mut BufferPool) -> io::Result<bool> {
+        match self.root_page_id {
+            None => Ok(false),
+            Some(root_id) => self.search_node(root_id, key, buffer_pool),
+        }
     }
 }
 impl Node {
-    fn empty_leaf() -> Self {
-        Node {
-            keys: Vec::new(),
-            children: Vec::new(),
-            is_leaf: true
+    // Serialize node to page data
+    fn serialize(&self) -> [u8; PAGE_SIZE] {
+        let mut data = [0u8; PAGE_SIZE];
+        let mut offset = 0;
+
+        // Write is_leaf flag
+        data[offset] = if self.is_leaf { 1 } else { 0 };
+        offset += 1;
+
+        // Write number of keys
+        let key_count = self.keys.len() as u32;
+        data[offset..offset + 4].copy_from_slice(&key_count.to_le_bytes());
+        offset += 4;
+
+        // Write keys
+        for key in &self.keys {
+            data[offset..offset + 8].copy_from_slice(&key.0.to_le_bytes());
+            offset += 8;
         }
+
+        // Write number of children
+        let child_count = self.children.len() as u32;
+        data[offset..offset + 4].copy_from_slice(&child.count.to_le_bytes());
+        offset += 4;
+
+        // Write children
+        for child in &self.children {
+            data[offset..offset + 8].copy_from_slice(&child.0.to_le_bytes());
+            offset += 8;
+        }
+
+        data
     }
 
-    fn search(&self, key: PageId) -> Option<&PageId> {
-        let mut i = 0;
-        while i < self.keys.len() && key > &self.keys[i] {
-            i++;
+    // Deserialize node from page data
+    fn deserialize(data: &[u8; PAGE_SIZE]) -> Self {
+        let mut offset = 0;
+
+        // Read is_leaf flag
+        let is_leaf = data[offset] == 1;
+        offset += 1;
+
+        // Read number of keys
+        let key_count = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]) as usize;
+        offset += 4;
+
+        // Read keys
+        let mut keys = Vec::with_capacity(key_count);
+        for _ in 0..key_count {
+            let key_val = u64::from_le_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]
+            ]);
+            keys.push(PageId(key_val));
+            offset += 8;
         }
 
-        if i < self.keys.len() && key == &self.keys[i] {
-            return Some(&self.keys[i]);
-        }
-
-        if self.is_leaf {
-            None
-        } else {
-            self.children[i].search(key)
-        }
-    }
-
-    fn split_child(&mut self, i: usize) {
-        let mut y = self.children.remove(i);
-        let mut z = Node {
-            keys: y.keys.split_off(T),
-            children: if y.is_leaf {
-                Vec::new()
-            } else {
-                y.children.split_off(T) // takes the last (len - T) keys 
-            },
-            is_leaf: y.is_leaf,
-        };
+        // Read number of children
+        let child_count = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]) as usize;
+        offset += 4;
         
-        let up_key = y.keys.pop().expect("Should exist during split"); // takes middle key
-
-        self.keys.insert(i, up_key);
-        self.children.insert(i, y);
-        self.children.insert(i + 1, z);
-    }
-
-    fn insert_non_full(&mut self, key: PageId){
-        let mut i = self.keys.len();
-        if self.is_leaf {
-            while i > 0 && key < self.keys[i - 1] {
-                i -= 1;
-            }
-            self.keys.insert(i, key);
-        } else {
-            while i > 0 && key < self.keys[i - 1] {
-                i -= 1;
-            }
-            if self.children[i].keys.len() == 2 * T - 1 {
-                self.split_child(i);
-                if key > self.keys[i] {
-                    i += 1;
-                }
-            }
-            self.children[i].insert_non_full(key);
+        // Read children
+        let mut children = Vec::with_capacity(child_count);
+        for _ in 0..child_count {
+            let child_val = u64::from_le_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]
+            ]);
+            children.push(PageId(child_val));
+            offset += 8;
         }
-    }
+        
+        Node { keys, children, is_leaf }
 
-    fn print_inorder(&self) {
-        if self.is_leaf {
-            for k in &self.keys {
-                print!("{} ", k.clone());
-            }
-        } else {
-            for i in 0..self.keys.len() {
-                self.children[i].print_inorder();
-                print!("{} ", self.keys[i].clone());
-            }
-            self.children[self.keys.len()].print_inorder();
-        }
     }
 }
 

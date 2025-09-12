@@ -21,6 +21,10 @@ impl BufferPool {
         }
     }
 
+    pub fn allocate_page(&mut self) -> io::Result<PageId> {
+        self.page.allocate_page().map(|page| page.id)
+    }
+
     // Fetch a page from the buffer pool (load from disk if not cached)
     pub fn get_page(&mut self, id: PageId) -> io::Result<&mut Page> {
         if self.cache.contains_key(&id) {
