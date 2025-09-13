@@ -16,6 +16,8 @@ pub struct Node {
     is_leaf: bool
 }
 
+const T: usize = 3;
+
 impl BTree {
     fn new() -> Self {
         BTree {
@@ -61,6 +63,108 @@ impl BTree {
             Some(root_id) => self.search_node(root_id, key, buffer_pool),
         }
     }
+
+    fn load_node(&self, page_id: PageId, buffer_pool: &mut BufferPool) -> io::Result<Node> {
+        let page = buffer_pool.get_page(page_id)?;
+        Ok(Node::deserialize(&page.data))
+    }
+
+    fn save_node(&self, page_id: PageId, node: &Node, buffer_pool: &mut BufferPool) -> io::Result<()> {
+        let page = buffer_pool.get_page(page_id)?;
+        page.data = node.serialize();
+        buffer_pool.mark_dirty(page_id);
+        Ok(())
+    }
+
+    fn allocate_node(&self, node: Node, buffer_pool: &mut BufferPool) -> io::Result<PageId> {
+        let page_id = buffer_pool.allocate_page();
+        Ok(page_id)
+    }
+
+    fn search_node(&self, page_id: PageId, key: PageId, buffer_pool: &mut BufferPool) -> io::Result<bool> {
+        let node = self.load_node(page_id, buffer_pool)?;
+
+        let mut i = 0;
+        while i < node.keys.len() && key > node.keys[i] {
+            i += 1;
+        }
+
+        if i < node.keys.len() && key == node.keys[i] {
+            return Ok(true);
+        }
+
+        if node.is_leaf {
+            Ok(false)
+        } else {
+            self.search_node(node.children[i], key, buffer_pool)
+        }
+    }
+
+    fn insert_non_full(&self, page_id: PageId, key: PageId, buffer_pool: &mut BufferPool) -> io::Result<()> {
+        let mut node = self.load_node(page_id, buffer_pool)?;
+
+        let mut i = node.keys.len();
+        if node.is_leaf {
+            while i > 0 && key < node.keys[i - 1] {
+                i -= 1;
+            }
+            node.keys.insert(i, key);
+            self.save_node(page_id, &node, buffer_pool)?;
+        } else {
+            while i > 0 && key < node.keys[i - 1] {
+                i -= 1;
+            }
+
+            let child_id = node.children[i];
+            let child_node = self.load_node(child_id, buffer_pool)?;
+
+            if child_node.keys.len() == 2 * T - 1 {
+                self.split_child(page_id, i, buffer_pool)?;
+                let updated_node = self.load_node(page_id, buffer_pool)?;
+                if key > updated_node.keys[i] {
+                    i += 1;
+                }
+            }
+
+            let updated_node = self.load_node(page_id, buffer_pool)?;
+            self.insert_non_full(updated_node.children[i], key, buffer_pool)?;
+        }
+        Ok(())
+    }
+
+    fn split_child(&self, parent_id: PageId, child_index: usize, buffer_pool: &mut BufferPool) -> io::Result<()> {
+        let mut parent = self.load_node(parent_id, buffer_pool)?;
+        let child_id = parent.children[child_index];
+        let mut child = self.load_node(child_id, buffer_pool)?;
+        
+        // Create new right child
+        let mut new_child = Node {
+            keys: child.keys.split_off(T),
+            children: if child.is_leaf {
+                Vec::new()
+            } else {
+                child.children.split_off(T)
+            },
+            is_leaf: child.is_leaf,
+        };
+        
+        let up_key = child.keys.pop().expect("Should exist during split");
+        
+        // Allocate page for new child
+        let new_child_id = self.allocate_node(new_child, buffer_pool)?;
+        
+        // Update parent
+        parent.keys.insert(child_index, up_key);
+        parent.children.insert(child_index + 1, new_child_id);
+        
+        // Save all modified nodes
+        self.save_node(parent_id, &parent, buffer_pool)?;
+        self.save_node(child_id, &child, buffer_pool)?;
+        
+        Ok(())
+    } 
+
+    
 }
 impl Node {
     // Serialize node to page data
@@ -85,7 +189,7 @@ impl Node {
 
         // Write number of children
         let child_count = self.children.len() as u32;
-        data[offset..offset + 4].copy_from_slice(&child.count.to_le_bytes());
+        data[offset..offset + 4].copy_from_slice(&child_count.to_le_bytes());
         offset += 4;
 
         // Write children
@@ -146,3 +250,93 @@ impl Node {
 
 
 
+/* 
+Visual Walkthrough of insert_non_full
+
+Scenario: Insert key PageId(25) into this B-tree (T=3, so max keys = 5):
+
+Initial B-tree:
+                Root (PageId=1)
+             [10, 30, 50, 70]
+            /    |    |    |   \
+        Child0 Child1 Child2 Child3 Child4
+      PageId=2 PageId=3 PageId=4 PageId=5 PageId=6
+       [5,8]    [15,20]  [35,40]  [55,60]  [75,80]
+
+Step 1: Load the root node
+
+let mut node = self.load_node(page_id, buffer_pool)?; // Load Root (PageId=1)
+// node.keys = [10, 30, 50, 70]
+// node.children = [2, 3, 4, 5, 6]
+// node.is_leaf = false
+
+Step 2: Find insertion position
+
+let mut i = node.keys.len(); // i = 4
+if node.is_leaf { // false, so skip this branch
+    // ...
+} else {
+    // Find where key=25 should go
+    while i > 0 && key < node.keys[i - 1] {
+        i -= 1;
+    }
+}
+
+Visual trace of the while loop:
+
+key = 25
+i = 4: 25 < 70? Yes → i = 3
+i = 3: 25 < 50? Yes → i = 2  
+i = 2: 25 < 30? Yes → i = 1
+i = 1: 25 < 10? No → stop
+Final: i = 1
+
+So key=25 should go in child[1] (between keys 10 and 30).
+
+Step 3: Check if child needs splitting
+
+let child_id = node.children[i]; // child_id = PageId(3)
+let child_node = self.load_node(child_id, buffer_pool)?;
+// child_node.keys = [15, 20]  (only 2 keys, not full)
+
+if child_node.keys.len() == 2 * T - 1 { // 2 != 5, so false
+    // Skip splitting
+}
+
+Child1 (PageId=3): [15, 20]  ← Only 2 keys (max is 5), so no split needed
+
+Step 4: Recursively insert into child
+
+let updated_node = self.load_node(page_id, buffer_pool)?; // Reload root
+self.insert_non_full(updated_node.children[i], key, buffer_pool)?;
+// Calls insert_non_full(PageId(3), 25, buffer_pool)
+
+Step 5: Recursive call on child (PageId=3)
+
+// Now we're in the child node
+let mut node = self.load_node(PageId(3), buffer_pool)?;
+// node.keys = [15, 20]
+// node.is_leaf = true
+
+let mut i = node.keys.len(); // i = 2
+if node.is_leaf { // true!
+    while i > 0 && key < node.keys[i - 1] {
+        i -= 1;
+    }
+    // i=2: 25 < 20? No → stop
+    // Final: i = 2
+    
+    node.keys.insert(i, key); // Insert 25 at position 2
+    // node.keys = [15, 20, 25]
+    
+    self.save_node(page_id, &node, buffer_pool)?; // Save the modified child
+}
+
+
+Final Result:
+Root (PageId=1)
+[10, 30, 50, 70]
+/    |    |    |   \
+[5,8] [15,20,25] [35,40] [55,60] [75,80]
+       ↑ Added 25 here
+*/
